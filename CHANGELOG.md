@@ -19,6 +19,11 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 * `jj git push --bookmark <name>` will now automatically track the bookmark if
   it isn't tracked with any remote already.
 
+* Changed Git representation of conflicted commits to include files from the
+  first side of the conflict. This should prevent unchanged files from being
+  highlighted as "added" in editors when checking out a conflicted commit in a
+  colocated workspace.
+
 ### Fixed bugs
 
 * `jj git push` now ensures that tracked remote bookmarks are updated even if
