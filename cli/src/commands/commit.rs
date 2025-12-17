@@ -152,6 +152,7 @@ new working-copy commit.
         )
     };
     let tree = diff_selector.select(
+        ui,
         Diff::new(&base_tree, &commit.tree()),
         matcher.as_ref(),
         format_instructions,
