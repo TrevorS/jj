@@ -14,10 +14,15 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Deprecations
 
+* The `:ours` and `:theirs` merge tools are deprecated. Use `:select` instead.
+
 ### New features
 
 * `jj git push --bookmark <name>` will now automatically track the bookmark if
   it isn't tracked with any remote already.
+
+* `jj resolve --tool :select` can be used to interactively select a single
+  side of a conflict to keep, discarding all other sides.
 
 ### Fixed bugs
 
