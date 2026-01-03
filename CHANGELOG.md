@@ -35,6 +35,9 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 * Setting the editor via `ui.editor`, `$EDITOR`, or `JJ_EDITOR` now respects shell quoting.
 
+* Conflict labels are now preserved correctly when restoring files from commits
+  with different conflict labels.
+
 ## [0.37.0] - 2026-01-07
 
 ### Release highlights
