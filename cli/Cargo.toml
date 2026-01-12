@@ -82,6 +82,7 @@ indexmap = { workspace = true }
 indoc = { workspace = true }
 itertools = { workspace = true }
 jj-lib = { workspace = true }
+jjhub-backend = { path = "../../jjhub/crates/jjhub-backend" }
 maplit = { workspace = true }
 once_cell = { workspace = true }
 pest = { workspace = true }
