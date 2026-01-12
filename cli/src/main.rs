@@ -19,7 +19,11 @@ use jj_cli::cli_util::CommandHelper;
 use jj_cli::command_error::CommandError;
 use jj_cli::command_error::user_error;
 use jj_cli::ui::Ui;
+use jj_lib::backend::CommitId;
+use jj_lib::merge::Merge;
 use jj_lib::object_id::ObjectId;
+use jj_lib::op_store::{RefTarget, RemoteRef, RemoteRefState};
+use jj_lib::ref_name::{RefName, RefNameBuf, RemoteName};
 use jj_lib::repo::StoreFactories;
 use jj_lib::signing::Signer;
 use jj_lib::workspace::Workspace;
@@ -28,6 +32,9 @@ use jjhub_backend::JjhubBackend;
 use jjhub_backend::JjhubClient;
 use jjhub_backend::JjhubCommitId;
 use jjhub_backend::JjhubConfig;
+
+/// The default remote name for jjhub.
+const JJHUB_REMOTE_NAME: &str = "jjhub";
 
 /// Create store factories with jjhub backend registered.
 fn create_store_factories() -> StoreFactories {
@@ -61,6 +68,8 @@ enum JjhubCommand {
     Fetch(JjhubFetchArgs),
     /// Push bookmarks to the server
     Push(JjhubPushArgs),
+    /// Login to a jjhub server and store authentication token
+    Login(JjhubLoginArgs),
 }
 
 #[derive(clap::Args, Clone, Debug)]
@@ -101,6 +110,16 @@ struct JjhubPushArgs {
     create: bool,
 }
 
+#[derive(clap::Args, Clone, Debug)]
+struct JjhubLoginArgs {
+    /// Username to authenticate as
+    #[arg(long, short = 'u')]
+    username: Option<String>,
+    /// Server URL (uses current repository's server if not specified)
+    #[arg(long)]
+    server: Option<String>,
+}
+
 fn run_custom_command(
     ui: &mut Ui,
     command_helper: &CommandHelper,
@@ -112,6 +131,7 @@ fn run_custom_command(
             JjhubCommand::Clone(args) => run_jjhub_clone(ui, command_helper, args),
             JjhubCommand::Fetch(args) => run_jjhub_fetch(ui, command_helper, args),
             JjhubCommand::Push(args) => run_jjhub_push(ui, command_helper, args),
+            JjhubCommand::Login(args) => run_jjhub_login(ui, command_helper, args),
         },
     }
 }
@@ -157,9 +177,7 @@ fn run_jjhub_clone(
     // Parse URL: https://host/owner/repo or jjhub://host/owner/repo
     let (base_url, owner, repo) = parse_jjhub_url(&args.url)?;
 
-    let dest = args
-        .destination
-        .unwrap_or_else(|| PathBuf::from(&repo));
+    let dest = args.destination.unwrap_or_else(|| PathBuf::from(&repo));
 
     // Create destination directory
     if dest.exists() {
@@ -201,7 +219,7 @@ fn run_jjhub_fetch(
     command_helper: &CommandHelper,
     args: JjhubFetchArgs,
 ) -> Result<(), CommandError> {
-    let workspace_command = command_helper.workspace_helper(ui)?;
+    let mut workspace_command = command_helper.workspace_helper(ui)?;
     let store_path = workspace_command.repo_path().join("store");
 
     // Load jjhub config to get server/owner/repo
@@ -212,12 +230,17 @@ fn run_jjhub_fetch(
         ))
     })?;
 
-    let client = JjhubClient::new(&config.base_url);
+    // Create client with auth token if available
+    let client = if let Some(ref token) = config.token {
+        JjhubClient::with_token(&config.base_url, token)
+    } else {
+        JjhubClient::new(&config.base_url)
+    };
 
     // List remote bookmarks
-    let remote_bookmarks = client.list_bookmarks(&config.owner, &config.repo).map_err(|e| {
-        user_error(format!("Failed to list remote bookmarks: {}", e))
-    })?;
+    let remote_bookmarks = client
+        .list_bookmarks(&config.owner, &config.repo)
+        .map_err(|e| user_error(format!("Failed to list remote bookmarks: {}", e)))?;
 
     // Filter bookmarks if specific ones requested
     let bookmarks_to_fetch: Vec<_> = if args.bookmark.is_empty() {
@@ -242,6 +265,11 @@ fn run_jjhub_fetch(
         config.repo
     )?;
 
+    // Start a transaction to update remote tracking refs
+    let mut tx = workspace_command.start_transaction();
+    let remote_name = RemoteName::new(JJHUB_REMOTE_NAME);
+    let mut fetched_count = 0;
+
     for bookmark_summary in &bookmarks_to_fetch {
         // Get full bookmark details
         match client.get_bookmark(&config.owner, &config.repo, &bookmark_summary.name) {
@@ -258,6 +286,38 @@ fn run_jjhub_fetch(
                     bookmark.targets().len(),
                     status
                 )?;
+
+                // Convert jjhub targets to jj-lib RefTarget
+                let ref_target = if bookmark.targets().is_empty() {
+                    RefTarget::absent()
+                } else if bookmark.targets().len() == 1 {
+                    // Single target - resolved
+                    let commit_id = CommitId::new(bookmark.targets()[0].as_bytes().to_vec());
+                    RefTarget::normal(commit_id)
+                } else {
+                    // Multiple targets - conflicted (merge all adds)
+                    let adds: Vec<Option<CommitId>> = bookmark
+                        .targets()
+                        .iter()
+                        .map(|t| Some(CommitId::new(t.as_bytes().to_vec())))
+                        .collect();
+                    // Merge needs alternating removes and adds, but for a conflict
+                    // we just have adds. Use empty removes between them.
+                    let removes = vec![None; adds.len().saturating_sub(1)];
+                    RefTarget::from_merge(Merge::from_removes_adds(removes, adds))
+                };
+
+                // Create RemoteRef for this bookmark
+                let remote_ref = RemoteRef {
+                    target: ref_target,
+                    state: RemoteRefState::Tracked, // Auto-track fetched bookmarks
+                };
+
+                // Update the remote tracking ref
+                let ref_name = RefName::new(&bookmark.name);
+                let symbol = ref_name.to_remote_symbol(&remote_name);
+                tx.repo_mut().set_remote_bookmark(symbol, remote_ref);
+                fetched_count += 1;
             }
             Ok(None) => {
                 writeln!(ui.status(), "  {} (not found)", bookmark_summary.name)?;
@@ -273,6 +333,17 @@ fn run_jjhub_fetch(
         }
     }
 
+    // Finish the transaction if we updated anything
+    if fetched_count > 0 {
+        tx.finish(
+            ui,
+            format!(
+                "fetch {} bookmark(s) from jjhub {}/{}",
+                fetched_count, config.owner, config.repo
+            ),
+        )?;
+    }
+
     writeln!(ui.status(), "Fetch complete")?;
     Ok(())
 }
@@ -282,7 +353,7 @@ fn run_jjhub_push(
     command_helper: &CommandHelper,
     args: JjhubPushArgs,
 ) -> Result<(), CommandError> {
-    let workspace_command = command_helper.workspace_helper(ui)?;
+    let mut workspace_command = command_helper.workspace_helper(ui)?;
     let store_path = workspace_command.repo_path().join("store");
 
     // Load jjhub config
@@ -293,8 +364,13 @@ fn run_jjhub_push(
         ))
     })?;
 
-    let client = JjhubClient::new(&config.base_url);
-    let repo = workspace_command.repo();
+    // Create client with auth token if available
+    let client = if let Some(ref token) = config.token {
+        JjhubClient::with_token(&config.base_url, token)
+    } else {
+        JjhubClient::new(&config.base_url)
+    };
+    let repo = workspace_command.repo().clone();
 
     // Get local bookmarks from the view
     let view = repo.view();
@@ -333,6 +409,9 @@ fn run_jjhub_push(
         config.repo
     )?;
 
+    // Collect successfully pushed bookmarks for updating remote tracking refs
+    let mut pushed_bookmarks: Vec<(RefNameBuf, RefTarget)> = Vec::new();
+
     for bookmark_name in &bookmarks_to_push {
         let name_str = bookmark_name.as_str();
         let local_target = view.get_local_bookmark(bookmark_name);
@@ -344,7 +423,11 @@ fn run_jjhub_push(
             .collect();
 
         if commit_ids.is_empty() {
-            writeln!(ui.warning_default(), "{} has no targets, skipping", name_str)?;
+            writeln!(
+                ui.warning_default(),
+                "{} has no targets, skipping",
+                name_str
+            )?;
             continue;
         }
 
@@ -385,6 +468,9 @@ fn run_jjhub_push(
                     action,
                     bookmark.version
                 )?;
+
+                // Record for remote tracking update
+                pushed_bookmarks.push((name_str.into(), local_target.clone()));
             }
             Err(e) => {
                 writeln!(ui.warning_default(), "{} failed: {}", name_str, e)?;
@@ -392,7 +478,110 @@ fn run_jjhub_push(
         }
     }
 
+    // Update remote tracking refs for successfully pushed bookmarks
+    if !pushed_bookmarks.is_empty() {
+        let mut tx = workspace_command.start_transaction();
+        let remote_name = RemoteName::new(JJHUB_REMOTE_NAME);
+
+        for (ref_name, target) in &pushed_bookmarks {
+            let remote_ref = RemoteRef {
+                target: target.clone(),
+                state: RemoteRefState::Tracked,
+            };
+            let symbol = ref_name.to_remote_symbol(&remote_name);
+            tx.repo_mut().set_remote_bookmark(symbol, remote_ref);
+        }
+
+        tx.finish(
+            ui,
+            format!(
+                "push {} bookmark(s) to jjhub {}/{}",
+                pushed_bookmarks.len(),
+                config.owner,
+                config.repo
+            ),
+        )?;
+    }
+
     writeln!(ui.status(), "Push complete")?;
+    Ok(())
+}
+
+fn run_jjhub_login(
+    ui: &mut Ui,
+    command_helper: &CommandHelper,
+    args: JjhubLoginArgs,
+) -> Result<(), CommandError> {
+    // Determine server URL - either from args or from current repo config
+    let (server_url, store_path) = if let Some(server) = args.server {
+        (server, None)
+    } else {
+        // Try to get from current repo
+        let workspace_command = command_helper.workspace_helper(ui)?;
+        let store_path = workspace_command.repo_path().join("store");
+        let config = JjhubConfig::load(&store_path).map_err(|e| {
+            user_error(format!(
+                "Not in a jjhub repository and no --server specified: {}",
+                e
+            ))
+        })?;
+        (config.base_url, Some(store_path))
+    };
+
+    // Get username
+    let username = if let Some(u) = args.username {
+        u
+    } else {
+        write!(ui.status(), "Username: ")?;
+        let mut input = String::new();
+        std::io::stdin()
+            .read_line(&mut input)
+            .map_err(|e| user_error(format!("Failed to read username: {}", e)))?;
+        input.trim().to_string()
+    };
+
+    if username.is_empty() {
+        return Err(user_error("Username cannot be empty"));
+    }
+
+    // Get password (hidden input)
+    let password = rpassword::prompt_password("Password: ")
+        .map_err(|e| user_error(format!("Failed to read password: {}", e)))?;
+
+    if password.is_empty() {
+        return Err(user_error("Password cannot be empty"));
+    }
+
+    // Attempt to authenticate
+    writeln!(ui.status(), "Authenticating...")?;
+    let client = JjhubClient::new(&server_url);
+    let token = client
+        .login(&username, &password)
+        .map_err(|e| user_error(format!("Authentication failed: {}", e)))?;
+
+    // Save token to config if we're in a repo
+    if let Some(store_path) = store_path {
+        let mut config = JjhubConfig::load(&store_path)
+            .map_err(|e| user_error(format!("Failed to load config: {}", e)))?;
+        config.set_token(Some(token.clone()));
+        config
+            .save(&store_path)
+            .map_err(|e| user_error(format!("Failed to save token: {}", e)))?;
+        writeln!(
+            ui.status(),
+            "Logged in as {} (token saved to repository)",
+            username
+        )?;
+    } else {
+        // Print token if not in a repo (user can manually save it)
+        writeln!(ui.status(), "Logged in as {}", username)?;
+        writeln!(ui.status(), "Token: {}", token)?;
+        writeln!(
+            ui.hint_default(),
+            "Run this command from within a jjhub repository to save the token automatically"
+        )?;
+    }
+
     Ok(())
 }
 
